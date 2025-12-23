@@ -1,244 +1,248 @@
-"""
-Minimal Kalshi HTTP + WebSocket clients.
-
-This module is intentionally small and matches the imports used by the user's
-script:
-
-  from clients import KalshiHttpClient, KalshiWebSocketClient, Environment
-
-Kalshi authentication (headers + RSA signature) can vary slightly between API
-versions. This implementation follows the common pattern:
-  - timestamp + METHOD + path + body (UTF-8)
-  - RSA-PSS + SHA256
-  - base64-encoded signature
-
-If Kalshi returns auth errors, adjust `_signing_payload()` and/or header names
-to match the current Kalshi docs.
-"""
-
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
-import threading
 import time
-from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Dict, Optional
 
 import requests
-import websocket
+import websockets
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 
-class Environment(str, Enum):
-    DEMO = "DEMO"
-    PROD = "PROD"
-
-    @property
-    def http_base_url(self) -> str:
-        # Common Kalshi endpoints; update if your account uses different hosts.
-        if self is Environment.DEMO:
-            return "https://demo-api.kalshi.com/trade-api/v2"
-        return "https://api.kalshi.com/trade-api/v2"
-
-    @property
-    def ws_base_url(self) -> str:
-        if self is Environment.DEMO:
-            return "wss://demo-api.kalshi.com/trade-api/ws/v2"
-        return "wss://api.kalshi.com/trade-api/ws/v2"
+class Environment(Enum):
+    DEMO = "demo"
+    PROD = "prod"
 
 
-@dataclass(frozen=True)
-class _AuthHeaders:
-    key: str
-    signature: str
-    timestamp: str
+class KalshiBaseClient:
+    """Base client class for interacting with the Kalshi API."""
 
-    def as_requests_headers(self) -> dict[str, str]:
-        return {
-            "KALSHI-ACCESS-KEY": self.key,
-            "KALSHI-ACCESS-SIGNATURE": self.signature,
-            "KALSHI-ACCESS-TIMESTAMP": self.timestamp,
-            "Content-Type": "application/json",
-        }
-
-    def as_websocket_headers(self) -> list[str]:
-        # websocket-client expects list[str] "Header: value"
-        return [
-            f"KALSHI-ACCESS-KEY: {self.key}",
-            f"KALSHI-ACCESS-SIGNATURE: {self.signature}",
-            f"KALSHI-ACCESS-TIMESTAMP: {self.timestamp}",
-        ]
-
-
-class KalshiHttpClient:
-    def __init__(self, *, key_id: str, private_key: Any, environment: Environment) -> None:
-        if not key_id:
-            raise ValueError("key_id is required")
-        if private_key is None:
-            raise ValueError("private_key is required")
-
-        self.key_id = key_id
-        self.private_key = private_key
-        self.environment = environment
-
-    def _signing_payload(self, *, timestamp: str, method: str, path: str, body: str) -> bytes:
-        # Most Kalshi examples sign: timestamp + method + path + body
-        return f"{timestamp}{method.upper()}{path}{body}".encode("utf-8")
-
-    def _auth_headers(self, *, method: str, path: str, body: str = "") -> _AuthHeaders:
-        # Using integer seconds is common for API signing; adjust if your docs require ms.
-        timestamp = str(int(time.time()))
-        payload = self._signing_payload(timestamp=timestamp, method=method, path=path, body=body)
-        signature_bytes = self.private_key.sign(
-            payload,
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-            hashes.SHA256(),
-        )
-        signature_b64 = base64.b64encode(signature_bytes).decode("ascii")
-        return _AuthHeaders(key=self.key_id, signature=signature_b64, timestamp=timestamp)
-
-    def _request(self, method: str, path: str, *, params: Optional[dict[str, Any]] = None, json_body: Any = None) -> Any:
-        # `path` should begin with "/" and be relative to trade-api/v2.
-        if not path.startswith("/"):
-            path = "/" + path
-
-        body_str = ""
-        if json_body is not None:
-            body_str = json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
-
-        auth = self._auth_headers(method=method, path=path, body=body_str)
-        url = self.environment.http_base_url + path
-
-        resp = requests.request(
-            method=method.upper(),
-            url=url,
-            params=params,
-            data=body_str if body_str else None,
-            headers=auth.as_requests_headers(),
-            timeout=30,
-        )
-
-        # Provide actionable errors (Kalshi usually returns JSON, but not always).
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Kalshi HTTP {resp.status_code} for {method} {path}: {resp.text}")
-
-        content_type = resp.headers.get("Content-Type", "")
-        if "application/json" in content_type:
-            return resp.json()
-        return resp.text
-
-    def get_balance(self) -> Any:
-        # Kalshi v2 commonly exposes portfolio balance at this path.
-        return self._request("GET", "/portfolio/balance")
-
-
-class KalshiWebSocketClient:
     def __init__(
         self,
-        *,
         key_id: str,
-        private_key: Any,
-        environment: Environment,
-        on_message: Optional[Callable[[str], None]] = None,
+        private_key: rsa.RSAPrivateKey,
+        environment: Environment = Environment.DEMO,
     ) -> None:
-        if not key_id:
-            raise ValueError("key_id is required")
-        if private_key is None:
-            raise ValueError("private_key is required")
+        """Initializes the client with the provided API key and private key.
 
+        Args:
+            key_id: Your Kalshi API key ID.
+            private_key: Your RSA private key.
+            environment: The API environment to use (DEMO or PROD).
+        """
         self.key_id = key_id
         self.private_key = private_key
         self.environment = environment
-        self._user_on_message = on_message
+        self.last_api_call = datetime.now()
 
-        self._ws_app: Optional[websocket.WebSocketApp] = None
-        self._thread: Optional[threading.Thread] = None
-        self._opened = threading.Event()
-        self._closed = threading.Event()
-        self._last_error: Optional[BaseException] = None
+        if self.environment == Environment.DEMO:
+            self.HTTP_BASE_URL = "https://demo-api.kalshi.co"
+            self.WS_BASE_URL = "wss://demo-api.kalshi.co"
+        elif self.environment == Environment.PROD:
+            self.HTTP_BASE_URL = "https://api.elections.kalshi.com"
+            self.WS_BASE_URL = "wss://api.elections.kalshi.com"
+        else:
+            raise ValueError("Invalid environment")
 
-    def _signing_payload(self, *, timestamp: str, method: str, path: str, body: str) -> bytes:
-        return f"{timestamp}{method.upper()}{path}{body}".encode("utf-8")
+    def request_headers(self, method: str, path: str) -> Dict[str, Any]:
+        """Generates the required authentication headers for API requests."""
+        current_time_milliseconds = int(time.time() * 1000)
+        timestamp_str = str(current_time_milliseconds)
 
-    def _auth_headers_for_handshake(self, *, ws_path: str) -> _AuthHeaders:
-        # For the WS handshake, many APIs sign a GET for the WS path.
-        timestamp = str(int(time.time()))
-        payload = self._signing_payload(timestamp=timestamp, method="GET", path=ws_path, body="")
-        signature_bytes = self.private_key.sign(
-            payload,
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-            hashes.SHA256(),
+        # Remove query params from path
+        path_parts = path.split("?")
+
+        msg_string = timestamp_str + method + path_parts[0]
+        signature = self.sign_pss_text(msg_string)
+
+        headers = {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp_str,
+        }
+        return headers
+
+    def sign_pss_text(self, text: str) -> str:
+        """Signs the text using RSA-PSS and returns the base64 encoded signature."""
+        message = text.encode("utf-8")
+        try:
+            signature = self.private_key.sign(
+                message,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+            return base64.b64encode(signature).decode("utf-8")
+        except InvalidSignature as e:
+            raise ValueError("RSA sign PSS failed") from e
+
+
+class KalshiHttpClient(KalshiBaseClient):
+    """Client for handling HTTP connections to the Kalshi API."""
+
+    def __init__(
+        self,
+        key_id: str,
+        private_key: rsa.RSAPrivateKey,
+        environment: Environment = Environment.DEMO,
+    ) -> None:
+        super().__init__(key_id, private_key, environment)
+        self.host = self.HTTP_BASE_URL
+        self.exchange_url = "/trade-api/v2/exchange"
+        self.markets_url = "/trade-api/v2/markets"
+        self.portfolio_url = "/trade-api/v2/portfolio"
+
+    def rate_limit(self) -> None:
+        """Built-in rate limiter to prevent exceeding API rate limits."""
+        threshold_ms = 100
+        now = datetime.now()
+        threshold_in_microseconds = 1000 * threshold_ms
+        threshold_in_seconds = threshold_ms / 1000
+        if now - self.last_api_call < timedelta(microseconds=threshold_in_microseconds):
+            time.sleep(threshold_in_seconds)
+        self.last_api_call = datetime.now()
+
+    def raise_if_bad_response(self, response: requests.Response) -> None:
+        """Raises an HTTPError if the response status code indicates an error."""
+        if response.status_code not in range(200, 299):
+            response.raise_for_status()
+
+    def post(self, path: str, body: dict) -> Any:
+        """Performs an authenticated POST request to the Kalshi API."""
+        self.rate_limit()
+        response = requests.post(
+            self.host + path,
+            json=body,
+            headers=self.request_headers("POST", path),
+            timeout=30,
         )
-        signature_b64 = base64.b64encode(signature_bytes).decode("ascii")
-        return _AuthHeaders(key=self.key_id, signature=signature_b64, timestamp=timestamp)
+        self.raise_if_bad_response(response)
+        return response.json()
+
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """Performs an authenticated GET request to the Kalshi API."""
+        self.rate_limit()
+        response = requests.get(
+            self.host + path,
+            headers=self.request_headers("GET", path),
+            params=params or {},
+            timeout=30,
+        )
+        self.raise_if_bad_response(response)
+        return response.json()
+
+    def delete(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """Performs an authenticated DELETE request to the Kalshi API."""
+        self.rate_limit()
+        response = requests.delete(
+            self.host + path,
+            headers=self.request_headers("DELETE", path),
+            params=params or {},
+            timeout=30,
+        )
+        self.raise_if_bad_response(response)
+        return response.json()
+
+    def get_balance(self) -> Dict[str, Any]:
+        """Retrieves the account balance."""
+        return self.get(self.portfolio_url + "/balance")
+
+    def get_exchange_status(self) -> Dict[str, Any]:
+        """Retrieves the exchange status."""
+        return self.get(self.exchange_url + "/status")
+
+    def get_trades(
+        self,
+        ticker: Optional[str] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        max_ts: Optional[int] = None,
+        min_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Retrieves trades based on provided filters."""
+        params: Dict[str, Any] = {
+            "ticker": ticker,
+            "limit": limit,
+            "cursor": cursor,
+            "max_ts": max_ts,
+            "min_ts": min_ts,
+        }
+        # Remove None values
+        params = {k: v for k, v in params.items() if v is not None}
+        return self.get(self.markets_url + "/trades", params=params)
+
+
+class KalshiWebSocketClient(KalshiBaseClient):
+    """Client for handling WebSocket connections to the Kalshi API."""
+
+    def __init__(
+        self,
+        key_id: str,
+        private_key: rsa.RSAPrivateKey,
+        environment: Environment = Environment.DEMO,
+    ) -> None:
+        super().__init__(key_id, private_key, environment)
+        self.ws: Optional[websockets.ClientConnection] = None
+        self.url_suffix = "/trade-api/ws/v2"
+        self.message_id = 1
 
     async def connect(self) -> None:
-        """
-        Open the WebSocket connection.
+        """Establishes a WebSocket connection using authentication."""
+        host = self.WS_BASE_URL + self.url_suffix
+        auth_headers = self.request_headers("GET", self.url_suffix)
+        async with websockets.connect(host, additional_headers=auth_headers) as websocket_conn:
+            self.ws = websocket_conn
+            await self.on_open()
+            await self.handler()
 
-        This is an async wrapper around websocket-client (threaded) so callers
-        can `asyncio.run(ws_client.connect())` as in the user's script.
-        """
-        if self._thread and self._thread.is_alive():
-            return
+    async def on_open(self) -> None:
+        """Callback when WebSocket connection is opened."""
+        print("WebSocket connection opened.")
+        await self.subscribe_to_tickers()
 
-        # websocket-client passes only the path portion to signing in many examples.
-        # Our ws_base_url already includes `/trade-api/ws/v2`; sign that path.
-        ws_path = "/trade-api/ws/v2"
-        auth = self._auth_headers_for_handshake(ws_path=ws_path)
-        url = self.environment.ws_base_url
+    async def subscribe_to_tickers(self) -> None:
+        """Subscribe to ticker updates for all markets."""
+        if self.ws is None:
+            raise RuntimeError("WebSocket is not connected")
 
-        def _on_open(_: websocket.WebSocketApp) -> None:
-            self._opened.set()
+        subscription_message = {
+            "id": self.message_id,
+            "cmd": "subscribe",
+            "params": {"channels": ["ticker"]},
+        }
+        await self.ws.send(json.dumps(subscription_message))
+        self.message_id += 1
 
-        def _on_message(_: websocket.WebSocketApp, message: str) -> None:
-            if self._user_on_message:
-                self._user_on_message(message)
+    async def handler(self) -> None:
+        """Handle incoming messages."""
+        if self.ws is None:
+            raise RuntimeError("WebSocket is not connected")
 
-        def _on_error(_: websocket.WebSocketApp, error: Any) -> None:
-            if isinstance(error, BaseException):
-                self._last_error = error
-            else:
-                self._last_error = RuntimeError(str(error))
+        try:
+            async for message in self.ws:
+                await self.on_message(message)
+        except websockets.ConnectionClosed as e:
+            await self.on_close(e.code, e.reason)
+        except Exception as e:  # noqa: BLE001
+            await self.on_error(e)
 
-        def _on_close(_: websocket.WebSocketApp, status_code: Any, msg: Any) -> None:
-            self._closed.set()
+    async def on_message(self, message: str) -> None:
+        """Callback for handling incoming messages."""
+        print("Received message:", message)
 
-        self._ws_app = websocket.WebSocketApp(
-            url,
-            header=auth.as_websocket_headers(),
-            on_open=_on_open,
-            on_message=_on_message,
-            on_error=_on_error,
-            on_close=_on_close,
-        )
+    async def on_error(self, error: BaseException) -> None:
+        """Callback for handling errors."""
+        print("WebSocket error:", error)
 
-        def _run() -> None:
-            try:
-                # Keepalive settings are conservative; tweak as needed.
-                self._ws_app.run_forever(ping_interval=30, ping_timeout=10)
-            except BaseException as e:  # noqa: BLE001
-                self._last_error = e
-                self._closed.set()
-
-        self._thread = threading.Thread(target=_run, name="kalshi-ws", daemon=True)
-        self._thread.start()
-
-        # Wait for either open, close, or error.
-        await asyncio.to_thread(self._opened.wait, 15)
-        if not self._opened.is_set():
-            if self._last_error:
-                raise RuntimeError(f"WebSocket error before open: {self._last_error}") from self._last_error
-            raise TimeoutError("Timed out waiting for WebSocket to open")
-
-    def close(self) -> None:
-        if self._ws_app:
-            try:
-                self._ws_app.close()
-            finally:
-                self._closed.set()
+    async def on_close(self, close_status_code: int, close_msg: str) -> None:
+        """Callback when WebSocket connection is closed."""
+        print("WebSocket connection closed with code:", close_status_code, "and message:", close_msg)
 
